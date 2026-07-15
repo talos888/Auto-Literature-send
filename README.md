@@ -13,7 +13,7 @@ Actions secret.
 - Scores candidates with transparent keyword rules.
 - Optionally asks DeepSeek to classify likely matches when `DEEPSEEK_API_KEY` is set
   as a GitHub Actions secret.
-- Emails the Markdown report and uploads Markdown/JSON output as a workflow artifact.
+- Emails a Chinese HTML summary and uploads Markdown/JSON/HTML/text output as a workflow artifact.
 
 ## Files
 

@@ -192,6 +192,35 @@ class CoreTests(unittest.TestCase):
         empty_report = radar.render_markdown([], config, start, end)
         self.assertIn("## No Relevant New Papers", empty_report)
 
+    def test_email_rendering_is_chinese_html_and_omits_run_log(self):
+        config = {"topic_name": "Test Radar", "lookback_days": 14}
+        start = radar.datetime(2026, 7, 1, tzinfo=radar.timezone.utc)
+        end = radar.datetime(2026, 7, 15, tzinfo=radar.timezone.utc)
+        paper = radar.Paper(
+            arxiv_id="2607.00001v1",
+            title="Agentic Self-Driving Lab",
+            authors=["Ada Lovelace"],
+            summary="A platform for closed-loop automated chemistry experiments.",
+            published="2026-07-14T23:00:00Z",
+            updated="",
+            categories=["cs.AI"],
+            abs_url="http://arxiv.org/abs/2607.00001v1",
+            pdf_url="https://arxiv.org/pdf/2607.00001v1",
+            decision="include",
+            relevance="strong",
+            rationale="这篇文章介绍了面向自动化化学实验的闭环平台。",
+            rule_reasons=["strong: self-driving lab"],
+        )
+
+        html = radar.render_email_html([paper], config, start, end)
+        text = radar.render_email_text([paper], config, start, end)
+
+        self.assertIn("每周 arXiv 自动化实验室文献雷达", html)
+        self.assertIn("中文简介", html)
+        self.assertIn("为什么值得看", text)
+        self.assertNotIn("Fetched:", html)
+        self.assertNotIn("Wrote ", text)
+
 
 if __name__ == "__main__":
     unittest.main()

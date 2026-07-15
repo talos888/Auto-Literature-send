@@ -59,7 +59,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          latest_report="$(ls -1t literature-radar/out/*.md | head -n 1)"
+          latest_report="$(find literature-radar/out -maxdepth 1 -name 'literature-radar-*.md' -printf '%T@ %p\n' | sort -nr | head -n 1 | cut -d' ' -f2-)"
           echo "path=${latest_report}" >> "$GITHUB_OUTPUT"
 
       - name: Email radar report

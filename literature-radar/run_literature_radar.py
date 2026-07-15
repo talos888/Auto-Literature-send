@@ -21,6 +21,7 @@ import urllib.request
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta, timezone
+from html import escape
 from pathlib import Path
 from typing import Any
 
@@ -270,7 +271,9 @@ def build_classification_prompt(paper: Paper) -> str:
         domains such as blockchain, networking, generic robotics without a lab
         or scientific discovery component, or generic AI without experiments.
 
-        Return JSON only.
+        Return JSON only. The rationale must be written in concise Chinese.
+        In the rationale, explain in 1-2 sentences what the paper is about and
+        why it is or is not relevant to AI-driven automated laboratories.
 
         Title: {paper.title}
         Categories: {", ".join(paper.categories)}
@@ -356,6 +359,142 @@ def render_markdown(papers: list[Paper], config: dict[str, Any], start: datetime
     return "\n".join(lines)
 
 
+def render_email_html(papers: list[Paper], config: dict[str, Any], start: datetime, end: datetime) -> str:
+    included = [p for p in papers if p.decision == "include"]
+    review = [p for p in papers if p.decision == "review"]
+    generated = end.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+    body = [
+        "<!doctype html>",
+        '<html lang="zh-CN">',
+        "<head>",
+        '<meta charset="utf-8">',
+        "<style>",
+        "body{margin:0;padding:0;background:#f6f7f9;color:#18202a;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,'Noto Sans SC',sans-serif;line-height:1.55;}",
+        ".wrap{max-width:760px;margin:0 auto;padding:24px 16px;}",
+        ".header{border-bottom:3px solid #2864c9;padding-bottom:14px;margin-bottom:18px;}",
+        "h1{font-size:24px;margin:0 0 8px 0;color:#111827;}",
+        ".meta{font-size:13px;color:#5b6472;}",
+        "h2{font-size:18px;margin:26px 0 12px;color:#111827;}",
+        ".paper{background:#ffffff;border:1px solid #d9dee8;border-radius:8px;padding:16px;margin:0 0 14px 0;}",
+        ".title{font-size:16px;font-weight:700;margin:0 0 8px;color:#111827;}",
+        ".authors,.detail{font-size:13px;color:#4b5563;margin:4px 0;}",
+        ".summary{font-size:14px;margin:10px 0;color:#1f2937;}",
+        ".why{font-size:14px;margin:10px 0;padding:10px 12px;background:#eef5ff;border-left:4px solid #2864c9;color:#1f365c;}",
+        ".links a{display:inline-block;margin-right:12px;color:#1d4ed8;text-decoration:none;font-size:14px;}",
+        ".empty{background:#fff;border:1px solid #d9dee8;border-radius:8px;padding:16px;color:#4b5563;}",
+        "</style>",
+        "</head>",
+        "<body>",
+        '<div class="wrap">',
+        '<div class="header">',
+        "<h1>每周 arXiv 自动化实验室文献雷达</h1>",
+        f'<div class="meta">主题：{escape(config["topic_name"])} ｜ 生成时间：{escape(generated)} ｜ 检索窗口：过去 {escape(str(config["lookback_days"]))} 天</div>',
+        "</div>",
+    ]
+
+    if included:
+        body.append("<h2>强相关文献</h2>")
+        body.extend(render_email_section(included))
+    if review:
+        body.append("<h2>待复核候选</h2>")
+        body.extend(render_email_section(review))
+    if not included and not review:
+        body.append('<div class="empty">本周没有筛选出新的强相关或待复核文献。</div>')
+
+    body.extend(["</div>", "</body>", "</html>"])
+    return "\n".join(body)
+
+
+def render_email_section(papers: list[Paper]) -> list[str]:
+    lines: list[str] = []
+    for index, paper in enumerate(papers, start=1):
+        authors = ", ".join(paper.authors[:6])
+        if len(paper.authors) > 6:
+            authors += ", et al."
+        lines.extend(
+            [
+                '<article class="paper">',
+                f'<p class="title">{index}. {escape(paper.title)}</p>',
+                f'<p class="authors">作者：{escape(authors or "未提供")}</p>',
+                f'<p class="detail">分类：{escape(", ".join(paper.categories) or "未提供")} ｜ 提交时间：{escape(paper.published or "未提供")}</p>',
+                f'<p class="summary">中文简介：{escape(chinese_summary(paper))}</p>',
+                f'<p class="why">为什么值得看：{escape(chinese_rationale(paper))}</p>',
+                f'<p class="links"><a href="{escape(paper.abs_url)}">arXiv 页面</a><a href="{escape(paper.pdf_url)}">PDF</a></p>',
+                "</article>",
+            ]
+        )
+    return lines
+
+
+def render_email_text(papers: list[Paper], config: dict[str, Any], start: datetime, end: datetime) -> str:
+    included = [p for p in papers if p.decision == "include"]
+    review = [p for p in papers if p.decision == "review"]
+    lines = [
+        "每周 arXiv 自动化实验室文献雷达",
+        f"主题：{config['topic_name']}",
+        f"检索窗口：过去 {config['lookback_days']} 天",
+        "",
+    ]
+    if included:
+        lines.extend(["强相关文献", ""])
+        lines.extend(render_email_text_section(included))
+    if review:
+        lines.extend(["待复核候选", ""])
+        lines.extend(render_email_text_section(review))
+    if not included and not review:
+        lines.append("本周没有筛选出新的强相关或待复核文献。")
+    return "\n".join(lines)
+
+
+def render_email_text_section(papers: list[Paper]) -> list[str]:
+    lines: list[str] = []
+    for index, paper in enumerate(papers, start=1):
+        authors = ", ".join(paper.authors[:6])
+        if len(paper.authors) > 6:
+            authors += ", et al."
+        lines.extend(
+            [
+                f"{index}. {paper.title}",
+                f"作者：{authors or '未提供'}",
+                f"分类：{', '.join(paper.categories) or '未提供'}",
+                f"中文简介：{chinese_summary(paper)}",
+                f"为什么值得看：{chinese_rationale(paper)}",
+                f"arXiv：{paper.abs_url}",
+                f"PDF：{paper.pdf_url}",
+                "",
+            ]
+        )
+    return lines
+
+
+def chinese_summary(paper: Paper) -> str:
+    if paper.rationale and not paper.rationale.startswith("Rule score"):
+        return paper.rationale
+    summary = paper.summary.strip()
+    if not summary:
+        return "该论文摘要未提供；建议打开 arXiv 页面查看详情。"
+    return "该论文关注 " + truncate_text(summary, 220)
+
+
+def chinese_rationale(paper: Paper) -> str:
+    evidence = "; ".join(paper.rule_reasons or [])
+    if paper.relevance == "strong":
+        prefix = "它被判为强相关"
+    else:
+        prefix = "它可能相关，需要人工快速复核"
+    if evidence:
+        return f"{prefix}，主要依据是：{evidence}。"
+    return f"{prefix}，但规则证据较少，建议只作候选浏览。"
+
+
+def truncate_text(text: str, limit: int) -> str:
+    normalized = clean_text(text)
+    if len(normalized) <= limit:
+        return normalized
+    return normalized[: limit - 1].rstrip() + "…"
+
+
 def render_section(title: str, papers: list[Paper]) -> list[str]:
     lines = [f"## {title}", ""]
     if not papers:
@@ -424,12 +563,18 @@ def main() -> int:
     stamp = end.strftime("%Y-%m-%d")
     json_path = out_dir / f"literature-radar-{stamp}.json"
     md_path = out_dir / f"literature-radar-{stamp}.md"
+    html_path = out_dir / f"literature-radar-{stamp}.email.html"
+    text_path = out_dir / f"literature-radar-{stamp}.email.txt"
     json_path.write_text(json.dumps([asdict(p) for p in papers], ensure_ascii=False, indent=2), encoding="utf-8")
     md_path.write_text(report, encoding="utf-8")
+    html_path.write_text(render_email_html(papers, config, start, end), encoding="utf-8")
+    text_path.write_text(render_email_text(papers, config, start, end), encoding="utf-8")
     save_seen_ids(state_dir, seen_ids.union({paper.arxiv_id for paper in fetched_papers}))
 
     print(f"Wrote {md_path}")
     print(f"Wrote {json_path}")
+    print(f"Wrote {html_path}")
+    print(f"Wrote {text_path}")
     print(f"Fetched: {len(fetched_papers)}")
     print(f"New candidates: {len(papers)}")
     print(f"Included: {sum(1 for p in papers if p.decision == 'include')}")

@@ -34,14 +34,18 @@ def redact(text: str, secrets: list[str]) -> str:
 
 
 def build_message(report_path: Path, subject: str, sender: str, recipient: str) -> EmailMessage:
-    report = report_path.read_text(encoding="utf-8")
+    html_path = report_path.with_name(report_path.name.replace(".md", ".email.html"))
+    text_path = report_path.with_name(report_path.name.replace(".md", ".email.txt"))
+    plain_body = text_path.read_text(encoding="utf-8") if text_path.exists() else report_path.read_text(encoding="utf-8")
     msg = EmailMessage()
     msg["Subject"] = subject
     msg["From"] = sender
     msg["To"] = recipient
-    msg.set_content(report)
+    msg.set_content(plain_body)
+    if html_path.exists():
+        msg.add_alternative(html_path.read_text(encoding="utf-8"), subtype="html")
     msg.add_attachment(
-        report,
+        report_path.read_text(encoding="utf-8"),
         subtype="markdown",
         filename=report_path.name,
     )
