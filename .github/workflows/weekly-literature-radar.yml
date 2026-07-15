@@ -1,0 +1,84 @@
+name: Weekly Literature Radar
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 08:00 every Monday in Asia/Singapore, expressed in UTC.
+    - cron: "0 0 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  scan-arxiv:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Restore radar state
+        uses: actions/cache@v4
+        with:
+          path: literature-radar/.radar-state
+          key: literature-radar-state-${{ github.run_id }}
+          restore-keys: |
+            literature-radar-state-
+
+      - name: Secret hygiene check
+        shell: bash
+        run: |
+          set -euo pipefail
+          if grep -RInE \
+            --exclude-dir=.git \
+            --exclude-dir=literature-radar/out \
+            --exclude='*.md' \
+            '(sk-[A-Za-z0-9_-]{20,}|DEEPSEEK_API_KEY[[:space:]]*=[[:space:]]*[^ $][^[:space:]]+|OPENAI_API_KEY[[:space:]]*=[[:space:]]*[^ $][^[:space:]]+|SMTP_PASSWORD[[:space:]]*=[[:space:]]*[^ $][^[:space:]]+|MAIL_PASSWORD[[:space:]]*=[[:space:]]*[^ $][^[:space:]]+)' \
+            .; then
+            echo "Secret-like text was found in repository files. Move it to GitHub Secrets."
+            exit 1
+          fi
+
+      - name: Run unit tests
+        run: |
+          python -m unittest discover -s literature-radar/tests
+
+      - name: Run literature radar
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+        run: |
+          python literature-radar/run_literature_radar.py
+
+      - name: Find latest report
+        id: report
+        shell: bash
+        run: |
+          set -euo pipefail
+          latest_report="$(ls -1t literature-radar/out/*.md | head -n 1)"
+          echo "path=${latest_report}" >> "$GITHUB_OUTPUT"
+
+      - name: Email radar report
+        env:
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          SMTP_SSL: ${{ secrets.SMTP_SSL }}
+          MAIL_FROM: ${{ secrets.MAIL_FROM }}
+          MAIL_TO: ${{ secrets.MAIL_TO }}
+        run: |
+          python literature-radar/send_email.py \
+            --report "${{ steps.report.outputs.path }}" \
+            --subject "Weekly arXiv Literature Radar"
+
+      - name: Upload radar output
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: literature-radar-report
+          path: literature-radar/out/

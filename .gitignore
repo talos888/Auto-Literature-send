@@ -1,0 +1,14 @@
+.env
+.env.*
+*.env
+secrets.*
+*.key
+*.pem
+literature-radar/out/
+literature-radar/.radar-state/
+literature-radar/tmp-verify-out/
+literature-radar/tmp-verify-state/
+literature-radar/.test-state/
+literature-radar/__pycache__/
+literature-radar/tests/__pycache__/
+__pycache__/

@@ -1,0 +1,64 @@
+{
+  "topic_name": "AI / automated science labs",
+  "lookback_days": 14,
+  "max_results": 150,
+  "page_size": 100,
+  "request_retries": 4,
+  "retry_initial_delay_seconds": 5,
+  "retry_max_delay_seconds": 60,
+  "strong_keywords": [
+    "self-driving lab",
+    "self driving lab",
+    "autonomous laboratory",
+    "autonomous lab",
+    "automated laboratory",
+    "robotic laboratory",
+    "laboratory automation",
+    "closed-loop experiment",
+    "closed loop experiment",
+    "AI scientist",
+    "agentic self-driving lab"
+  ],
+  "context_keywords": [
+    "materials discovery",
+    "chemical discovery",
+    "reaction optimization",
+    "synthesis planning",
+    "experiment planning",
+    "Bayesian optimization",
+    "robotic chemistry",
+    "autonomous science",
+    "AI for science",
+    "scientific discovery",
+    "nanoparticle",
+    "catalyst",
+    "wet lab",
+    "high-throughput experimentation"
+  ],
+  "negative_keywords": [
+    "blockchain",
+    "validator node",
+    "network scaling",
+    "wireless network",
+    "traffic signal",
+    "game theory"
+  ],
+  "arxiv_categories": [
+    "cs.AI",
+    "cs.LG",
+    "cs.RO",
+    "stat.ML",
+    "cond-mat.mtrl-sci",
+    "physics.chem-ph",
+    "physics.app-ph",
+    "q-bio.QM"
+  ],
+  "llm": {
+    "enabled": true,
+    "provider": "deepseek",
+    "model": "deepseek-v4-flash",
+    "base_url": "https://api.deepseek.com",
+    "min_rule_score_for_review": 3,
+    "request_delay_seconds": 2
+  }
+}
