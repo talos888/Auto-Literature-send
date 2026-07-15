@@ -26,9 +26,9 @@ jobs:
         uses: actions/cache@v6
         with:
           path: literature-radar/.radar-state
-          key: literature-radar-state-${{ github.run_id }}
+          key: literature-radar-state-v2-${{ github.run_id }}
           restore-keys: |
-            literature-radar-state-
+            literature-radar-state-v2-
 
       - name: Secret hygiene check
         shell: bash
