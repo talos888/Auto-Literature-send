@@ -47,6 +47,11 @@ class Paper:
     decision: str = "unknown"
     relevance: str = "unknown"
     rationale: str = ""
+    ai_lab_type: str = "unknown"
+    domain: str = "unknown"
+    capabilities: list[str] | None = None
+    rp_transfer: list[str] | None = None
+    priority: str = "normal"
 
 
 def utc_now() -> datetime:
@@ -236,6 +241,11 @@ def classify_with_llm(papers: list[Paper], config: dict[str, Any]) -> None:
             paper.decision = result["decision"]
             paper.relevance = result["relevance"]
             paper.rationale = result["rationale"]
+            paper.ai_lab_type = result["ai_lab_type"]
+            paper.domain = result["domain"]
+            paper.capabilities = result["capabilities"]
+            paper.rp_transfer = result["rp_transfer"]
+            paper.priority = result["priority"]
             time.sleep(float(llm_config.get("request_delay_seconds", 2)))
         except Exception as exc:  # Keep the scheduled job useful even if LLM is down.
             paper.rationale = f"{paper.rationale} LLM review failed: {redact_secret(str(exc), api_key)}"
@@ -263,15 +273,28 @@ def build_classification_prompt(paper: Paper) -> str:
         automated laboratories and self-driving scientific discovery.
 
         Include papers about real or proposed scientific-experiment workflows
-        involving AI agents, machine learning, optimization, robotics, lab
-        automation, closed-loop experimentation, autonomous chemistry/materials
-        platforms, or automated wet-lab/physical experiments.
+        involving embodied AI, AI experimentalists, scientific agents, machine
+        learning, optimization, robotics, lab automation, closed-loop
+        experimentation, autonomous chemistry/materials platforms, or automated
+        wet-lab/physical experiments. Keep the scope broad across scientific
+        domains. Do not require photonics or van der Waals materials for inclusion.
 
         Exclude papers that only use closed-loop/control language in unrelated
         domains such as blockchain, networking, generic robotics without a lab
         or scientific discovery component, or generic AI without experiments.
 
-        Return JSON only. The rationale must be written in concise Chinese.
+        Return JSON only with these keys:
+        - decision: include, review, or exclude
+        - relevance: strong, weak, or unlikely
+        - rationale: concise Chinese explanation
+        - ai_lab_type: a short English type label
+        - domain: a short English scientific-domain label
+        - capabilities: a JSON list of short English capability labels
+        - rp_transfer: a JSON list of methods transferable to a state-aware AI
+          laboratory for van der Waals nonlinear photonic devices; use [] when none
+        - priority: high, normal, or low
+
+        The rationale must be written in concise Chinese.
         In the rationale, explain in 1-2 sentences what the paper is about and
         why it is or is not relevant to AI-driven automated laboratories.
 
@@ -289,7 +312,7 @@ def call_chat_completion(
     api_key: str,
     model: str,
     llm_config: dict[str, Any],
-) -> dict[str, str]:
+) -> dict[str, Any]:
     base_url = llm_config.get("base_url", "https://api.deepseek.com").rstrip("/")
     payload = {
         "model": model,
@@ -298,7 +321,7 @@ def call_chat_completion(
                 "role": "system",
                 "content": (
                     "You classify scientific papers for a weekly literature radar. "
-                    "Return only valid JSON with keys decision, relevance, rationale."
+                    "Return only valid JSON with the requested screening and transfer keys."
                 ),
             },
             {"role": "user", "content": prompt},
@@ -325,11 +348,25 @@ def call_chat_completion(
         raise RuntimeError(f"Invalid decision: {parsed.get('decision')}")
     if parsed.get("relevance") not in {"strong", "weak", "unlikely"}:
         raise RuntimeError(f"Invalid relevance: {parsed.get('relevance')}")
+    priority = str(parsed.get("priority", "normal"))
+    if priority not in {"high", "normal", "low"}:
+        priority = "normal"
     return {
         "decision": parsed["decision"],
         "relevance": parsed["relevance"],
         "rationale": str(parsed.get("rationale", "")),
+        "ai_lab_type": str(parsed.get("ai_lab_type", "unknown"))[:80],
+        "domain": str(parsed.get("domain", "unknown"))[:80],
+        "capabilities": normalize_string_list(parsed.get("capabilities")),
+        "rp_transfer": normalize_string_list(parsed.get("rp_transfer")),
+        "priority": priority,
     }
+
+
+def normalize_string_list(value: Any, limit: int = 8) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item).strip()[:120] for item in value[:limit] if str(item).strip()]
 
 
 def review_threshold(config: dict[str, Any]) -> int:
@@ -420,11 +457,19 @@ def render_email_section(papers: list[Paper]) -> list[str]:
                 f'<p class="detail">分类：{escape(", ".join(paper.categories) or "未提供")} ｜ 提交时间：{escape(paper.published or "未提供")}</p>',
                 f'<p class="summary">中文简介：{escape(chinese_summary(paper))}</p>',
                 f'<p class="why">为什么值得看：{escape(chinese_rationale(paper))}</p>',
+                render_transfer_html(paper),
                 f'<p class="links"><a href="{escape(paper.abs_url)}">arXiv 页面</a><a href="{escape(paper.pdf_url)}">PDF</a></p>',
                 "</article>",
             ]
         )
     return lines
+
+
+def render_transfer_html(paper: Paper) -> str:
+    if not paper.rp_transfer:
+        return ""
+    transfer = "；".join(paper.rp_transfer)
+    return f'<p class="detail">对 RP 的可迁移方法：{escape(transfer)}</p>'
 
 
 def render_email_text(papers: list[Paper], config: dict[str, Any], start: datetime, end: datetime) -> str:
@@ -460,6 +505,7 @@ def render_email_text_section(papers: list[Paper]) -> list[str]:
                 f"分类：{', '.join(paper.categories) or '未提供'}",
                 f"中文简介：{chinese_summary(paper)}",
                 f"为什么值得看：{chinese_rationale(paper)}",
+                *([f"对 RP 的可迁移方法：{'；'.join(paper.rp_transfer)}"] if paper.rp_transfer else []),
                 f"arXiv：{paper.abs_url}",
                 f"PDF：{paper.pdf_url}",
                 "",
@@ -512,6 +558,11 @@ def render_section(title: str, papers: list[Paper]) -> list[str]:
                 f"- Published: `{paper.published}`",
                 f"- Categories: `{', '.join(paper.categories)}`",
                 f"- Relevance: `{paper.relevance}`",
+                f"- AI-lab type: `{paper.ai_lab_type}`",
+                f"- Scientific domain: `{paper.domain}`",
+                f"- Capabilities: {', '.join(paper.capabilities or ['not classified'])}",
+                f"- RP transfer: {', '.join(paper.rp_transfer or ['none identified'])}",
+                f"- Priority: `{paper.priority}`",
                 f"- Reason: {paper.rationale}",
                 f"- Rule evidence: {'; '.join(paper.rule_reasons or ['none'])}",
                 f"- arXiv: {paper.abs_url}",
