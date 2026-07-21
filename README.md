@@ -13,6 +13,12 @@ Actions secret.
 - Scores candidates with transparent keyword rules.
 - Optionally asks DeepSeek to classify likely matches when `DEEPSEEK_API_KEY` is set
   as a GitHub Actions secret.
+- Covers both established and emerging AI-lab language, including AI
+  experimentalists, robot scientists, autonomous experimentation, and agentic
+  science, without narrowing discovery to one scientific domain.
+- Adds structured AI-lab type, domain, capability, priority, and optional
+  transfer-to-vdW-photonics tags during LLM review. These tags annotate broad
+  discovery results; they do not exclude papers outside photonics.
 - Emails a Chinese HTML summary and uploads Markdown/JSON/HTML/text output as a workflow artifact.
 
 ## Files

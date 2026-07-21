@@ -35,6 +35,125 @@ def base_config():
 
 
 class CoreTests(unittest.TestCase):
+    def test_qumus_style_embodied_ai_experimentalist_is_recalled(self):
+        config = json.loads((ROOT / "config.json").read_text(encoding="utf-8"))
+        paper = radar.Paper(
+            arxiv_id="2607.99999v1",
+            title="Qumus: Realization of an Embodied AI Quantum Material Experimentalist",
+            authors=[],
+            summary=(
+                "A multimodal multi-agent system performs closed-loop experimentation, "
+                "autonomous error correction, and real-world scientific discovery."
+            ),
+            published="",
+            updated="",
+            categories=["cond-mat.mtrl-sci"],
+            abs_url="",
+            pdf_url="",
+        )
+
+        scored = radar.score_with_rules(paper, config)
+
+        self.assertNotEqual(scored.decision, "exclude")
+
+    def test_ai_experimentalist_phrase_is_a_strong_match(self):
+        config = json.loads((ROOT / "config.json").read_text(encoding="utf-8"))
+        paper = radar.Paper(
+            arxiv_id="2607.66666v1",
+            title="An Embodied AI Experimentalist for Physics",
+            authors=[],
+            summary="A multimodal agent plans, operates, and diagnoses physical measurements.",
+            published="",
+            updated="",
+            categories=["physics.app-ph"],
+            abs_url="",
+            pdf_url="",
+        )
+
+        scored = radar.score_with_rules(paper, config)
+
+        self.assertEqual(scored.decision, "include")
+
+    def test_generic_embodied_ai_robotics_is_not_promoted(self):
+        config = json.loads((ROOT / "config.json").read_text(encoding="utf-8"))
+        paper = radar.Paper(
+            arxiv_id="2607.88888v1",
+            title="Embodied AI for Humanoid Locomotion",
+            authors=[],
+            summary="A physical AI policy improves walking and game-play control.",
+            published="",
+            updated="",
+            categories=["cs.RO"],
+            abs_url="",
+            pdf_url="",
+        )
+
+        scored = radar.score_with_rules(paper, config)
+
+        self.assertEqual(scored.decision, "exclude")
+
+    def test_llm_prompt_requests_broad_ai_lab_and_rp_transfer_tags(self):
+        paper = radar.Paper(
+            arxiv_id="2607.77777v1",
+            title="An AI Experimentalist",
+            authors=[],
+            summary="An autonomous physical experiment platform.",
+            published="",
+            updated="",
+            categories=["physics.app-ph"],
+            abs_url="",
+            pdf_url="",
+        )
+
+        prompt = radar.build_classification_prompt(paper)
+
+        self.assertIn("embodied AI", prompt)
+        self.assertIn("rp_transfer", prompt)
+        self.assertIn("Do not require photonics", prompt)
+
+    def test_llm_response_parses_transfer_tags(self):
+        response_body = json.dumps(
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "decision": "include",
+                                    "relevance": "strong",
+                                    "rationale": "真实物理实验中的自主故障恢复方法。",
+                                    "ai_lab_type": "embodied experimentalist",
+                                    "domain": "quantum materials",
+                                    "capabilities": ["fault recovery", "tool use"],
+                                    "rp_transfer": ["state verification"],
+                                    "priority": "high",
+                                }
+                            )
+                        }
+                    }
+                ]
+            }
+        ).encode("utf-8")
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return response_body
+
+        with patch.object(radar.urllib.request, "urlopen", return_value=FakeResponse()):
+            result = radar.call_chat_completion(
+                "prompt", "secret", "model", {"base_url": "https://example.invalid"}
+            )
+
+        self.assertEqual(result["decision"], "include")
+        self.assertEqual(result["rp_transfer"], ["state verification"])
+        self.assertEqual(result["priority"], "high")
+
     def test_category_bonus_is_capped_and_cannot_enter_review_alone(self):
         paper = radar.Paper(
             arxiv_id="1234.56789v1",
@@ -210,6 +329,7 @@ class CoreTests(unittest.TestCase):
             relevance="strong",
             rationale="这篇文章介绍了面向自动化化学实验的闭环平台。",
             rule_reasons=["strong: self-driving lab"],
+            rp_transfer=["workflow hierarchy", "fault recovery"],
         )
 
         html = radar.render_email_html([paper], config, start, end)
@@ -218,6 +338,8 @@ class CoreTests(unittest.TestCase):
         self.assertIn("每周 arXiv 自动化实验室文献雷达", html)
         self.assertIn("中文简介", html)
         self.assertIn("为什么值得看", text)
+        self.assertIn("workflow hierarchy", html)
+        self.assertIn("fault recovery", text)
         self.assertNotIn("Fetched:", html)
         self.assertNotIn("Wrote ", text)
 
