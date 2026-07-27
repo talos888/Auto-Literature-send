@@ -93,9 +93,23 @@ def normalize_arxiv_id(abs_url: str) -> str:
 
 
 def build_query(config: dict[str, Any], start: datetime, end: datetime) -> str:
+    return build_query_for_terms(config["strong_keywords"] + config["context_keywords"], start, end)
+
+
+def build_queries(config: dict[str, Any], start: datetime, end: datetime) -> list[str]:
+    terms = list(dict.fromkeys(config["strong_keywords"] + config["context_keywords"]))
+    terms_per_request = max(1, int(config.get("query_terms_per_request", 8)))
+    return [
+        build_query_for_terms(terms[index : index + terms_per_request], start, end)
+        for index in range(0, len(terms), terms_per_request)
+    ]
+
+
+def build_query_for_terms(terms: list[str], start: datetime, end: datetime) -> str:
+    if not terms:
+        raise ValueError("At least one arXiv search term is required")
     date_filter = f"submittedDate:[{start:%Y%m%d%H%M} TO {end:%Y%m%d%H%M}]"
-    all_terms = config["strong_keywords"] + config["context_keywords"]
-    keyword_terms = " OR ".join(f'all:"{term}"' for term in all_terms)
+    keyword_terms = " OR ".join(f'all:"{term}"' for term in terms)
     return f"({date_filter}) AND ({keyword_terms})"
 
 
@@ -108,12 +122,12 @@ def fetch_arxiv(
     retry_max_delay: float,
     retry_jitter_max: float = 5,
     retry_total_budget: float | None = None,
+    retry_deadline: float | None = None,
 ) -> list[Paper]:
     papers: list[Paper] = []
     seen_ids: set[str] = set()
     page_size = max(1, min(page_size, 100))
-    retry_deadline = None
-    if retry_total_budget is not None:
+    if retry_deadline is None and retry_total_budget is not None:
         retry_deadline = time.monotonic() + max(0, retry_total_budget)
     for start in range(0, max_results, page_size):
         batch_size = min(page_size, max_results - start)
@@ -135,10 +149,57 @@ def fetch_arxiv(
                 seen_ids.add(paper.arxiv_id)
         if len(batch) < batch_size:
             break
+        if start + batch_size >= max_results:
+            break
         if retry_deadline is not None and time.monotonic() + 3.1 > retry_deadline:
             raise RuntimeError("arXiv retry budget exhausted before the next result page")
         time.sleep(3.1)
     return papers
+
+
+def fetch_arxiv_queries(
+    queries: list[str],
+    max_results: int,
+    max_results_per_query: int,
+    page_size: int,
+    retries: int,
+    retry_initial_delay: float,
+    retry_max_delay: float,
+    retry_jitter_max: float = 5,
+    retry_total_budget: float | None = None,
+    request_interval: float = 3.1,
+) -> list[Paper]:
+    if not queries:
+        raise ValueError("At least one arXiv query is required")
+
+    retry_deadline = None
+    if retry_total_budget is not None:
+        retry_deadline = time.monotonic() + max(0, retry_total_budget)
+
+    papers_by_id: dict[str, Paper] = {}
+    for index, query in enumerate(queries):
+        batch = fetch_arxiv(
+            query,
+            max_results_per_query,
+            page_size,
+            retries,
+            retry_initial_delay,
+            retry_max_delay,
+            retry_jitter_max,
+            retry_deadline=retry_deadline,
+        )
+        for paper in batch:
+            papers_by_id.setdefault(paper.arxiv_id, paper)
+
+        if index == len(queries) - 1:
+            continue
+        interval = max(0.0, request_interval)
+        if retry_deadline is not None and time.monotonic() + interval > retry_deadline:
+            raise RuntimeError("arXiv retry budget exhausted before the next query batch")
+        time.sleep(interval)
+
+    papers = sorted(papers_by_id.values(), key=lambda paper: paper.published, reverse=True)
+    return papers[: max(0, max_results)]
 
 
 def fetch_arxiv_page(
@@ -161,7 +222,15 @@ def fetch_arxiv_page(
         }
     )
     url = f"{ARXIV_API}?{params}"
-    request = urllib.request.Request(url, headers={"User-Agent": "literature-radar/0.1"})
+    request = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": (
+                "Auto-Literature-send/1.0 "
+                "(+https://github.com/talos888/Auto-Literature-send)"
+            )
+        },
+    )
     retries = max(1, retries)
     for attempt in range(1, retries + 1):
         try:
@@ -695,18 +764,20 @@ def main() -> int:
     config = load_config(config_path)
     end = utc_now()
     start = end - timedelta(days=int(config["lookback_days"]))
-    query = build_query(config, start, end)
+    queries = build_queries(config, start, end)
 
     seen_ids = load_seen_ids(state_dir)
-    fetched_papers = fetch_arxiv(
-        query,
+    fetched_papers = fetch_arxiv_queries(
+        queries,
         int(config["max_results"]),
+        int(config.get("max_results_per_query", 30)),
         int(config.get("page_size", 100)),
         int(config.get("request_retries", 3)),
         float(config.get("retry_initial_delay_seconds", 5)),
         float(config.get("retry_max_delay_seconds", 60)),
         float(config.get("retry_jitter_max_seconds", 5)),
         float(config.get("retry_total_budget_seconds", 360)),
+        float(config.get("request_interval_seconds", 3.1)),
     )
     papers = [paper for paper in fetched_papers if paper.arxiv_id not in seen_ids]
     papers = [score_with_rules(paper, config) for paper in papers]
@@ -731,6 +802,7 @@ def main() -> int:
     print(f"Wrote {json_path}")
     print(f"Wrote {html_path}")
     print(f"Wrote {text_path}")
+    print(f"Query batches: {len(queries)}")
     print(f"Fetched: {len(fetched_papers)}")
     print(f"New candidates: {len(papers)}")
     print(f"Included: {sum(1 for p in papers if p.decision == 'include')}")

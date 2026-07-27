@@ -36,6 +36,58 @@ def base_config():
 
 
 class CoreTests(unittest.TestCase):
+    def test_arxiv_queries_are_split_into_small_term_batches(self):
+        config = base_config()
+        config["strong_keywords"] = [f"strong-{index}" for index in range(7)]
+        config["context_keywords"] = ["context-1", "context-2"]
+        config["query_terms_per_request"] = 3
+        start = radar.datetime(2026, 7, 1, tzinfo=radar.timezone.utc)
+        end = radar.datetime(2026, 7, 15, tzinfo=radar.timezone.utc)
+
+        queries = radar.build_queries(config, start, end)
+
+        self.assertEqual(len(queries), 3)
+        self.assertEqual([query.count('all:"') for query in queries], [3, 3, 3])
+        self.assertIn('all:"strong-0"', queries[0])
+        self.assertIn('all:"context-2"', queries[2])
+        self.assertTrue(all("submittedDate:[202607010000 TO 202607150000]" in query for query in queries))
+
+    def test_arxiv_query_batches_are_deduplicated_sorted_and_capped(self):
+        def paper(arxiv_id, published):
+            return radar.Paper(
+                arxiv_id=arxiv_id,
+                title=arxiv_id,
+                authors=[],
+                summary="",
+                published=published,
+                updated=published,
+                categories=[],
+                abs_url=f"https://arxiv.org/abs/{arxiv_id}",
+                pdf_url=f"https://arxiv.org/pdf/{arxiv_id}",
+            )
+
+        older = paper("2607.00001v1", "2026-07-10T00:00:00Z")
+        duplicate = paper("2607.00002v1", "2026-07-11T00:00:00Z")
+        newer = paper("2607.00003v1", "2026-07-12T00:00:00Z")
+        with (
+            patch.object(radar, "fetch_arxiv", side_effect=[[older, duplicate], [newer, duplicate]]) as fetch_mock,
+            patch.object(radar.time, "sleep"),
+        ):
+            papers = radar.fetch_arxiv_queries(
+                ["query-1", "query-2"],
+                max_results=2,
+                max_results_per_query=30,
+                page_size=30,
+                retries=2,
+                retry_initial_delay=1,
+                retry_max_delay=2,
+                retry_total_budget=None,
+                request_interval=0,
+            )
+
+        self.assertEqual([item.arxiv_id for item in papers], ["2607.00003v1", "2607.00002v1"])
+        self.assertEqual(fetch_mock.call_count, 2)
+
     def test_qumus_style_embodied_ai_experimentalist_is_recalled(self):
         config = json.loads((ROOT / "config.json").read_text(encoding="utf-8"))
         paper = radar.Paper(
