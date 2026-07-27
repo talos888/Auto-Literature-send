@@ -32,6 +32,7 @@ from typing import Any
 ARXIV_API = "https://export.arxiv.org/api/query"
 OPENALEX_WORKS_API = "https://api.openalex.org/works"
 OPENALEX_ARXIV_SOURCE_ID = "S4306400194"
+SEMANTIC_SCHOLAR_BULK_API = "https://api.semanticscholar.org/graph/v1/paper/search/bulk"
 ATOM_NS = {"a": "http://www.w3.org/2005/Atom"}
 SECRET_FIELD_NAMES = {"api_key", "apikey", "secret", "token", "password"}
 TRANSIENT_HTTP_STATUS_CODES = {429, 500, 502, 503, 504}
@@ -122,6 +123,13 @@ def build_openalex_searches(config: dict[str, Any]) -> list[str]:
     if not searches:
         raise ValueError("At least one OpenAlex search term is required")
     return searches
+
+
+def build_semantic_scholar_query(config: dict[str, Any]) -> str:
+    terms = list(dict.fromkeys(config["strong_keywords"] + config["context_keywords"]))
+    if not terms:
+        raise ValueError("At least one Semantic Scholar search term is required")
+    return " | ".join(f'"{term.replace(chr(34), "")}"' for term in terms)
 
 
 def build_query_for_terms(terms: list[str], start: datetime, end: datetime) -> str:
@@ -330,9 +338,15 @@ def fetch_openalex(
     searches = build_openalex_searches(config)
     papers_by_id: dict[str, Paper] = {}
     successful_queries = 0
+    failed_queries = 0
     interval = max(0.0, float(config.get("openalex_request_interval_seconds", 1)))
+    total_budget = max(0.0, float(config.get("openalex_retry_total_budget_seconds", 90)))
+    retry_deadline = time.monotonic() + total_budget
 
     for index, search in enumerate(searches):
+        if time.monotonic() >= retry_deadline:
+            failed_queries += len(searches) - index
+            break
         try:
             batch = fetch_openalex_search(
                 search,
@@ -343,6 +357,7 @@ def fetch_openalex(
                 float(config.get("openalex_retry_initial_delay_seconds", 5)),
                 float(config.get("openalex_retry_max_delay_seconds", 30)),
                 float(config.get("openalex_retry_jitter_max_seconds", 2)),
+                retry_deadline,
             )
             successful_queries += 1
             for paper in batch:
@@ -350,6 +365,7 @@ def fetch_openalex(
                     continue
                 papers_by_id.setdefault(paper.arxiv_id, paper)
         except Exception as exc:
+            failed_queries += 1
             print(
                 f"OpenAlex query batch {index + 1}/{len(searches)} failed "
                 f"({describe_arxiv_error(exc)}); continuing with the other batches.",
@@ -358,10 +374,18 @@ def fetch_openalex(
             )
 
         if index < len(searches) - 1:
+            remaining = retry_deadline - time.monotonic()
+            if interval > remaining:
+                failed_queries += len(searches) - index - 1
+                break
             time.sleep(interval)
 
-    if successful_queries == 0:
-        raise RuntimeError("All OpenAlex fallback query batches failed")
+    if failed_queries:
+        raise RuntimeError(
+            f"OpenAlex fallback was incomplete: {failed_queries}/{len(searches)} query batches failed"
+        )
+    if successful_queries != len(searches):
+        raise RuntimeError("OpenAlex fallback did not complete every query batch")
 
     papers = sorted(papers_by_id.values(), key=lambda paper: paper.published, reverse=True)
     return papers[: max(0, int(config["max_results"]))]
@@ -376,24 +400,27 @@ def fetch_openalex_search(
     retry_initial_delay: float,
     retry_max_delay: float,
     retry_jitter_max: float,
+    retry_deadline: float | None = None,
 ) -> list[Paper]:
     per_page = max(1, min(max_results, 200))
-    params = urllib.parse.urlencode(
-        {
-            "filter": (
-                f"from_publication_date:{start:%Y-%m-%d},"
-                f"to_publication_date:{end:%Y-%m-%d},"
-                f"locations.source.id:{OPENALEX_ARXIV_SOURCE_ID}"
-            ),
-            "search": search,
-            "per-page": per_page,
-            "sort": "publication_date:desc",
-            "select": (
-                "id,display_name,publication_date,updated_date,"
-                "authorships,locations,abstract_inverted_index"
-            ),
-        }
-    )
+    query_params = {
+        "filter": (
+            f"from_publication_date:{start:%Y-%m-%d},"
+            f"to_publication_date:{end:%Y-%m-%d},"
+            f"locations.source.id:{OPENALEX_ARXIV_SOURCE_ID}"
+        ),
+        "search": search,
+        "per-page": per_page,
+        "sort": "publication_date:desc",
+        "select": (
+            "id,display_name,publication_date,updated_date,"
+            "authorships,locations,abstract_inverted_index"
+        ),
+    }
+    openalex_api_key = os.environ.get("OPENALEX_API_KEY")
+    if openalex_api_key:
+        query_params["api_key"] = openalex_api_key
+    params = urllib.parse.urlencode(query_params)
     request = urllib.request.Request(
         f"{OPENALEX_WORKS_API}?{params}",
         headers={
@@ -410,6 +437,7 @@ def fetch_openalex_search(
         retry_initial_delay,
         retry_max_delay,
         retry_jitter_max,
+        retry_deadline,
     )
     results = payload.get("results", [])
     if not isinstance(results, list):
@@ -425,6 +453,102 @@ def fetch_openalex_search(
     return papers
 
 
+def fetch_semantic_scholar(
+    config: dict[str, Any],
+    start: datetime,
+    end: datetime,
+) -> list[Paper]:
+    query_params = {
+        "query": build_semantic_scholar_query(config),
+        "publicationDateOrYear": f"{start:%Y-%m-%d}:{end:%Y-%m-%d}",
+        "fields": (
+            "title,abstract,authors,publicationDate,externalIds,"
+            "url,openAccessPdf,fieldsOfStudy"
+        ),
+        "sort": "publicationDate:desc",
+    }
+    request_headers = {
+        "User-Agent": (
+            "Auto-Literature-send/1.0 "
+            "(+https://github.com/talos888/Auto-Literature-send)"
+        )
+    }
+    semantic_scholar_api_key = os.environ.get("SEMANTIC_SCHOLAR_API_KEY")
+    if semantic_scholar_api_key:
+        request_headers["x-api-key"] = semantic_scholar_api_key
+
+    request = urllib.request.Request(
+        f"{SEMANTIC_SCHOLAR_BULK_API}?{urllib.parse.urlencode(query_params)}",
+        headers=request_headers,
+    )
+    total_budget = max(
+        0.0,
+        float(config.get("semantic_scholar_retry_total_budget_seconds", 60)),
+    )
+    payload = fetch_json_request(
+        request,
+        "Semantic Scholar",
+        int(config.get("semantic_scholar_request_retries", 2)),
+        float(config.get("semantic_scholar_retry_initial_delay_seconds", 5)),
+        float(config.get("semantic_scholar_retry_max_delay_seconds", 30)),
+        float(config.get("semantic_scholar_retry_jitter_max_seconds", 2)),
+        time.monotonic() + total_budget,
+    )
+    results = payload.get("data", [])
+    if not isinstance(results, list):
+        raise RuntimeError("Semantic Scholar response has no data list")
+
+    papers_by_id: dict[str, Paper] = {}
+    for work in results:
+        if not isinstance(work, dict):
+            continue
+        paper = paper_from_semantic_scholar_work(work)
+        if paper is None or not arxiv_id_month_overlaps_window(paper.arxiv_id, start, end):
+            continue
+        papers_by_id.setdefault(paper.arxiv_id, paper)
+
+    papers = sorted(papers_by_id.values(), key=lambda paper: paper.published, reverse=True)
+    return papers[: max(0, int(config["max_results"]))]
+
+
+def paper_from_semantic_scholar_work(work: dict[str, Any]) -> Paper | None:
+    external_ids = work.get("externalIds") or {}
+    if not isinstance(external_ids, dict):
+        return None
+    arxiv_id = normalize_arxiv_id(str(external_ids.get("ArXiv") or ""))
+    if not arxiv_id:
+        return None
+
+    authors: list[str] = []
+    for author in work.get("authors") or []:
+        if not isinstance(author, dict):
+            continue
+        name = clean_text(str(author.get("name") or ""))
+        if name:
+            authors.append(name)
+
+    fields_of_study = work.get("fieldsOfStudy") or []
+    categories: list[str] = []
+    if isinstance(fields_of_study, list):
+        categories = [
+            clean_text(str(field))
+            for field in fields_of_study
+            if clean_text(str(field))
+        ]
+    published = normalize_openalex_date(work.get("publicationDate"))
+    return Paper(
+        arxiv_id=arxiv_id,
+        title=clean_text(str(work.get("title") or "")),
+        authors=authors,
+        summary=clean_text(str(work.get("abstract") or "")),
+        published=published,
+        updated=published,
+        categories=categories,
+        abs_url=f"https://arxiv.org/abs/{arxiv_id}",
+        pdf_url=f"https://arxiv.org/pdf/{arxiv_id}",
+    )
+
+
 def fetch_json_request(
     request: urllib.request.Request,
     source_name: str,
@@ -432,11 +556,18 @@ def fetch_json_request(
     retry_initial_delay: float,
     retry_max_delay: float,
     retry_jitter_max: float,
+    retry_deadline: float | None = None,
 ) -> dict[str, Any]:
     retries = max(1, retries)
     for attempt in range(1, retries + 1):
         try:
-            with urllib.request.urlopen(request, timeout=45) as response:
+            timeout = 45.0
+            if retry_deadline is not None:
+                remaining = retry_deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError(f"{source_name} retry budget exhausted before request")
+                timeout = max(1.0, min(timeout, remaining))
+            with urllib.request.urlopen(request, timeout=timeout) as response:
                 payload = json.loads(response.read())
             if not isinstance(payload, dict):
                 raise RuntimeError(f"{source_name} returned a non-object JSON response")
@@ -451,6 +582,13 @@ def fetch_json_request(
                 retry_max_delay,
                 retry_jitter_max,
             )
+            if retry_deadline is not None:
+                remaining = max(0.0, retry_deadline - time.monotonic())
+                if delay > remaining:
+                    raise RuntimeError(
+                        f"{source_name} retry budget exhausted: "
+                        f"next wait is {delay:.1f}s but only {remaining:.1f}s remains"
+                    ) from exc
             print(
                 f"{source_name} request attempt {attempt}/{retries} failed "
                 f"({describe_arxiv_error(exc)}); retrying in {delay:.1f}s.",
@@ -1032,7 +1170,18 @@ def fetch_papers_with_fallback(
         )
 
     searches = build_openalex_searches(config)
-    return fetch_openalex(config, start, end), "OpenAlex arXiv index", len(searches)
+    try:
+        papers = fetch_openalex(config, start, end)
+        return papers, "OpenAlex arXiv index", len(searches)
+    except Exception as exc:
+        print(
+            f"OpenAlex fallback failed ({describe_arxiv_error(exc)}); "
+            "falling back to the Semantic Scholar arXiv index.",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    return fetch_semantic_scholar(config, start, end), "Semantic Scholar arXiv index", 1
 
 
 def main() -> int:

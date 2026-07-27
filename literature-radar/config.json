@@ -17,6 +17,12 @@
   "openalex_retry_initial_delay_seconds": 5,
   "openalex_retry_max_delay_seconds": 30,
   "openalex_retry_jitter_max_seconds": 2,
+  "openalex_retry_total_budget_seconds": 90,
+  "semantic_scholar_request_retries": 2,
+  "semantic_scholar_retry_initial_delay_seconds": 5,
+  "semantic_scholar_retry_max_delay_seconds": 30,
+  "semantic_scholar_retry_jitter_max_seconds": 2,
+  "semantic_scholar_retry_total_budget_seconds": 60,
   "strong_keywords": [
     "self-driving lab",
     "self driving lab",

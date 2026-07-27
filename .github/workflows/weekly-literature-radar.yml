@@ -38,7 +38,7 @@ jobs:
             --exclude-dir=.git \
             --exclude-dir=literature-radar/out \
             --exclude='*.md' \
-            '(sk-[A-Za-z0-9_-]{20,}|DEEPSEEK_API_KEY[[:space:]]*=[[:space:]]*[^ $][^[:space:]]+|OPENAI_API_KEY[[:space:]]*=[[:space:]]*[^ $][^[:space:]]+|SMTP_PASSWORD[[:space:]]*=[[:space:]]*[^ $][^[:space:]]+|MAIL_PASSWORD[[:space:]]*=[[:space:]]*[^ $][^[:space:]]+)' \
+            '(sk-[A-Za-z0-9_-]{20,}|DEEPSEEK_API_KEY[[:space:]]*=[[:space:]]*[^ $][^[:space:]]+|OPENAI_API_KEY[[:space:]]*=[[:space:]]*[^ $][^[:space:]]+|OPENALEX_API_KEY[[:space:]]*=[[:space:]]*[^ $][^[:space:]]+|SEMANTIC_SCHOLAR_API_KEY[[:space:]]*=[[:space:]]*[^ $][^[:space:]]+|SMTP_PASSWORD[[:space:]]*=[[:space:]]*[^ $][^[:space:]]+|MAIL_PASSWORD[[:space:]]*=[[:space:]]*[^ $][^[:space:]]+)' \
             .; then
             echo "Secret-like text was found in repository files. Move it to GitHub Secrets."
             exit 1
@@ -51,6 +51,8 @@ jobs:
       - name: Run literature radar
         env:
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          OPENALEX_API_KEY: ${{ secrets.OPENALEX_API_KEY }}
+          SEMANTIC_SCHOLAR_API_KEY: ${{ secrets.SEMANTIC_SCHOLAR_API_KEY }}
         shell: bash
         run: |
           set -euo pipefail

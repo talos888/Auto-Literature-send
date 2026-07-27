@@ -65,6 +65,13 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(searches[0], '("strong-0" OR "strong-1" OR "strong-2")')
         self.assertEqual(searches[2], '("context-2")')
 
+    def test_semantic_scholar_query_combines_all_terms_once(self):
+        config = base_config()
+
+        query = radar.build_semantic_scholar_query(config)
+
+        self.assertEqual(query, '"self-driving lab" | "materials discovery"')
+
     def test_arxiv_query_batches_are_deduplicated_sorted_and_capped(self):
         def paper(arxiv_id, published):
             return radar.Paper(
@@ -383,7 +390,7 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(paper.abs_url, "https://arxiv.org/abs/2607.00001")
         self.assertEqual(paper.pdf_url, "https://arxiv.org/pdf/2607.00001")
 
-    def test_openalex_batches_are_deduplicated_and_partial_failure_is_tolerated(self):
+    def test_openalex_partial_batch_failure_is_not_reported_as_complete(self):
         config = base_config()
         config["context_keywords"] = ["materials discovery", "automated experimentation"]
         config.update(
@@ -427,9 +434,8 @@ class CoreTests(unittest.TestCase):
             patch.object(radar.time, "sleep"),
             patch.object(radar.sys, "stderr", io.StringIO()),
         ):
-            papers = radar.fetch_openalex(config, start, end)
-
-        self.assertEqual([item.arxiv_id for item in papers], ["2607.00001"])
+            with self.assertRaisesRegex(RuntimeError, "incomplete"):
+                radar.fetch_openalex(config, start, end)
 
     def test_arxiv_failure_falls_back_to_openalex(self):
         config = base_config()
@@ -465,6 +471,66 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(source, "OpenAlex arXiv index")
         self.assertEqual(batches, 1)
         fallback_mock.assert_called_once_with(config, start, end)
+
+    def test_openalex_failure_falls_back_to_semantic_scholar(self):
+        config = base_config()
+        config.update(
+            {
+                "max_results": 10,
+                "max_results_per_query": 10,
+                "page_size": 10,
+                "query_terms_per_request": 10,
+            }
+        )
+        fallback_paper = radar.Paper(
+            arxiv_id="2607.00001",
+            title="Semantic Scholar fallback",
+            authors=[],
+            summary="",
+            published="2026-07-14T00:00:00Z",
+            updated="",
+            categories=[],
+            abs_url="https://arxiv.org/abs/2607.00001",
+            pdf_url="https://arxiv.org/pdf/2607.00001",
+        )
+        start = radar.datetime(2026, 7, 1, tzinfo=radar.timezone.utc)
+        end = radar.datetime(2026, 7, 15, tzinfo=radar.timezone.utc)
+        with (
+            patch.object(radar, "fetch_arxiv_queries", side_effect=RuntimeError("rate limited")),
+            patch.object(radar, "fetch_openalex", side_effect=RuntimeError("daily limit")),
+            patch.object(
+                radar,
+                "fetch_semantic_scholar",
+                return_value=[fallback_paper],
+            ) as fallback_mock,
+            patch.object(radar.sys, "stderr", io.StringIO()),
+        ):
+            papers, source, batches = radar.fetch_papers_with_fallback(config, start, end)
+
+        self.assertEqual(papers, [fallback_paper])
+        self.assertEqual(source, "Semantic Scholar arXiv index")
+        self.assertEqual(batches, 1)
+        fallback_mock.assert_called_once_with(config, start, end)
+
+    def test_semantic_scholar_work_requires_and_normalizes_arxiv_id(self):
+        work = {
+            "title": "An AI Experimentalist",
+            "abstract": "A closed-loop physical experiment.",
+            "publicationDate": "2026-07-14",
+            "externalIds": {"ArXiv": "2607.00001v2", "DOI": "10.1000/example"},
+            "authors": [{"name": "Ada Lovelace"}],
+            "fieldsOfStudy": ["Physics", "Computer Science"],
+        }
+
+        paper = radar.paper_from_semantic_scholar_work(work)
+
+        self.assertIsNotNone(paper)
+        assert paper is not None
+        self.assertEqual(paper.arxiv_id, "2607.00001")
+        self.assertEqual(paper.authors, ["Ada Lovelace"])
+        self.assertEqual(paper.categories, ["Physics", "Computer Science"])
+        self.assertEqual(paper.published, "2026-07-14T00:00:00Z")
+        self.assertIsNone(radar.paper_from_semantic_scholar_work({"title": "No arXiv ID"}))
 
     def test_arxiv_429_honors_retry_after_then_recovers(self):
         atom = b"""<?xml version="1.0" encoding="UTF-8"?>
@@ -572,6 +638,35 @@ class CoreTests(unittest.TestCase):
                     1,
                     60,
                     retry_deadline=110,
+                )
+
+        self.assertEqual(open_mock.call_count, 1)
+        sleep_mock.assert_not_called()
+
+    def test_json_retry_rejects_huge_retry_after_outside_total_budget(self):
+        rate_limited = radar.urllib.error.HTTPError(
+            "https://api.openalex.org/works",
+            429,
+            "Too Many Requests",
+            {"Retry-After": "62143"},
+            None,
+        )
+        request = radar.urllib.request.Request("https://api.openalex.org/works")
+        with (
+            patch.object(radar.urllib.request, "urlopen", side_effect=rate_limited) as open_mock,
+            patch.object(radar.random, "uniform", return_value=0),
+            patch.object(radar.time, "monotonic", return_value=100),
+            patch.object(radar.time, "sleep") as sleep_mock,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "retry budget exhausted"):
+                radar.fetch_json_request(
+                    request,
+                    "OpenAlex",
+                    retries=3,
+                    retry_initial_delay=5,
+                    retry_max_delay=30,
+                    retry_jitter_max=2,
+                    retry_deadline=190,
                 )
 
         self.assertEqual(open_mock.call_count, 1)
