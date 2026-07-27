@@ -30,6 +30,8 @@ from typing import Any
 
 
 ARXIV_API = "https://export.arxiv.org/api/query"
+OPENALEX_WORKS_API = "https://api.openalex.org/works"
+OPENALEX_ARXIV_SOURCE_ID = "S4306400194"
 ATOM_NS = {"a": "http://www.w3.org/2005/Atom"}
 SECRET_FIELD_NAMES = {"api_key", "apikey", "secret", "token", "password"}
 TRANSIENT_HTTP_STATUS_CODES = {429, 500, 502, 503, 504}
@@ -88,8 +90,12 @@ def reject_secrets_in_config(value: Any, path: Path, trail: str = "") -> None:
             reject_secrets_in_config(nested, path, f"{trail}[{index}]")
 
 
-def normalize_arxiv_id(abs_url: str) -> str:
-    return abs_url.rstrip("/").split("/")[-1]
+def normalize_arxiv_id(value: str) -> str:
+    extracted = extract_arxiv_id(value)
+    if extracted:
+        return extracted
+    arxiv_id = value.strip().removeprefix("arXiv:").removeprefix("arxiv:")
+    return re.sub(r"v\d+$", "", arxiv_id, flags=re.IGNORECASE)
 
 
 def build_query(config: dict[str, Any], start: datetime, end: datetime) -> str:
@@ -103,6 +109,19 @@ def build_queries(config: dict[str, Any], start: datetime, end: datetime) -> lis
         build_query_for_terms(terms[index : index + terms_per_request], start, end)
         for index in range(0, len(terms), terms_per_request)
     ]
+
+
+def build_openalex_searches(config: dict[str, Any]) -> list[str]:
+    terms = list(dict.fromkeys(config["strong_keywords"] + config["context_keywords"]))
+    terms_per_request = max(1, int(config.get("query_terms_per_request", 8)))
+    searches: list[str] = []
+    for index in range(0, len(terms), terms_per_request):
+        chunk = terms[index : index + terms_per_request]
+        quoted = " OR ".join(f'"{term.replace(chr(34), "")}"' for term in chunk)
+        searches.append(f"({quoted})")
+    if not searches:
+        raise ValueError("At least one OpenAlex search term is required")
+    return searches
 
 
 def build_query_for_terms(terms: list[str], start: datetime, end: datetime) -> str:
@@ -234,7 +253,13 @@ def fetch_arxiv_page(
     retries = max(1, retries)
     for attempt in range(1, retries + 1):
         try:
-            with urllib.request.urlopen(request, timeout=60) as response:
+            timeout = 60.0
+            if retry_deadline is not None:
+                remaining = retry_deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError("arXiv retry budget exhausted before the next request")
+                timeout = max(1.0, min(timeout, remaining))
+            with urllib.request.urlopen(request, timeout=timeout) as response:
                 root = ET.fromstring(response.read())
             break
         except Exception as exc:
@@ -297,12 +322,244 @@ def fetch_arxiv_page(
     return papers
 
 
+def fetch_openalex(
+    config: dict[str, Any],
+    start: datetime,
+    end: datetime,
+) -> list[Paper]:
+    searches = build_openalex_searches(config)
+    papers_by_id: dict[str, Paper] = {}
+    successful_queries = 0
+    interval = max(0.0, float(config.get("openalex_request_interval_seconds", 1)))
+
+    for index, search in enumerate(searches):
+        try:
+            batch = fetch_openalex_search(
+                search,
+                start,
+                end,
+                int(config.get("openalex_max_results_per_query", config.get("max_results_per_query", 40))),
+                int(config.get("openalex_request_retries", 3)),
+                float(config.get("openalex_retry_initial_delay_seconds", 5)),
+                float(config.get("openalex_retry_max_delay_seconds", 30)),
+                float(config.get("openalex_retry_jitter_max_seconds", 2)),
+            )
+            successful_queries += 1
+            for paper in batch:
+                if not arxiv_id_month_overlaps_window(paper.arxiv_id, start, end):
+                    continue
+                papers_by_id.setdefault(paper.arxiv_id, paper)
+        except Exception as exc:
+            print(
+                f"OpenAlex query batch {index + 1}/{len(searches)} failed "
+                f"({describe_arxiv_error(exc)}); continuing with the other batches.",
+                file=sys.stderr,
+                flush=True,
+            )
+
+        if index < len(searches) - 1:
+            time.sleep(interval)
+
+    if successful_queries == 0:
+        raise RuntimeError("All OpenAlex fallback query batches failed")
+
+    papers = sorted(papers_by_id.values(), key=lambda paper: paper.published, reverse=True)
+    return papers[: max(0, int(config["max_results"]))]
+
+
+def fetch_openalex_search(
+    search: str,
+    start: datetime,
+    end: datetime,
+    max_results: int,
+    retries: int,
+    retry_initial_delay: float,
+    retry_max_delay: float,
+    retry_jitter_max: float,
+) -> list[Paper]:
+    per_page = max(1, min(max_results, 200))
+    params = urllib.parse.urlencode(
+        {
+            "filter": (
+                f"from_publication_date:{start:%Y-%m-%d},"
+                f"to_publication_date:{end:%Y-%m-%d},"
+                f"locations.source.id:{OPENALEX_ARXIV_SOURCE_ID}"
+            ),
+            "search": search,
+            "per-page": per_page,
+            "sort": "publication_date:desc",
+            "select": (
+                "id,display_name,publication_date,updated_date,"
+                "authorships,locations,abstract_inverted_index"
+            ),
+        }
+    )
+    request = urllib.request.Request(
+        f"{OPENALEX_WORKS_API}?{params}",
+        headers={
+            "User-Agent": (
+                "Auto-Literature-send/1.0 "
+                "(+https://github.com/talos888/Auto-Literature-send)"
+            )
+        },
+    )
+    payload = fetch_json_request(
+        request,
+        "OpenAlex",
+        retries,
+        retry_initial_delay,
+        retry_max_delay,
+        retry_jitter_max,
+    )
+    results = payload.get("results", [])
+    if not isinstance(results, list):
+        raise RuntimeError("OpenAlex response has no results list")
+
+    papers: list[Paper] = []
+    for work in results:
+        if not isinstance(work, dict):
+            continue
+        paper = paper_from_openalex_work(work)
+        if paper is not None:
+            papers.append(paper)
+    return papers
+
+
+def fetch_json_request(
+    request: urllib.request.Request,
+    source_name: str,
+    retries: int,
+    retry_initial_delay: float,
+    retry_max_delay: float,
+    retry_jitter_max: float,
+) -> dict[str, Any]:
+    retries = max(1, retries)
+    for attempt in range(1, retries + 1):
+        try:
+            with urllib.request.urlopen(request, timeout=45) as response:
+                payload = json.loads(response.read())
+            if not isinstance(payload, dict):
+                raise RuntimeError(f"{source_name} returned a non-object JSON response")
+            return payload
+        except Exception as exc:
+            if not is_retryable_arxiv_error(exc) or attempt == retries:
+                raise
+            delay = arxiv_retry_delay(
+                exc,
+                attempt,
+                retry_initial_delay,
+                retry_max_delay,
+                retry_jitter_max,
+            )
+            print(
+                f"{source_name} request attempt {attempt}/{retries} failed "
+                f"({describe_arxiv_error(exc)}); retrying in {delay:.1f}s.",
+                file=sys.stderr,
+                flush=True,
+            )
+            time.sleep(delay)
+    raise AssertionError("unreachable")
+
+
+def paper_from_openalex_work(work: dict[str, Any]) -> Paper | None:
+    arxiv_id = ""
+    for location in work.get("locations") or []:
+        if not isinstance(location, dict):
+            continue
+        source = location.get("source") or {}
+        source_id = source.get("id", "") if isinstance(source, dict) else ""
+        if source_id and source_id.rstrip("/").split("/")[-1] != OPENALEX_ARXIV_SOURCE_ID:
+            continue
+        for field in ("landing_page_url", "pdf_url", "id"):
+            arxiv_id = extract_arxiv_id(str(location.get(field) or ""))
+            if arxiv_id:
+                break
+        if arxiv_id:
+            break
+    if not arxiv_id:
+        return None
+
+    authors: list[str] = []
+    for authorship in work.get("authorships") or []:
+        if not isinstance(authorship, dict):
+            continue
+        author = authorship.get("author") or {}
+        name = clean_text(str(author.get("display_name") or "")) if isinstance(author, dict) else ""
+        if name:
+            authors.append(name)
+
+    published = normalize_openalex_date(work.get("publication_date"))
+    updated = normalize_openalex_date(work.get("updated_date")) or published
+    return Paper(
+        arxiv_id=arxiv_id,
+        title=clean_text(str(work.get("display_name") or "")),
+        authors=authors,
+        summary=reconstruct_openalex_abstract(work.get("abstract_inverted_index")),
+        published=published,
+        updated=updated,
+        categories=[],
+        abs_url=f"https://arxiv.org/abs/{arxiv_id}",
+        pdf_url=f"https://arxiv.org/pdf/{arxiv_id}",
+    )
+
+
+def extract_arxiv_id(value: str) -> str:
+    decoded = urllib.parse.unquote(value).strip()
+    patterns = (
+        r"arxiv\.org/(?:abs|pdf)/([^?#]+)",
+        r"10\.48550/arxiv\.([^?#]+)",
+        r"(?:oai:)?arxiv\.org:([^?#]+)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, decoded, flags=re.IGNORECASE)
+        if not match:
+            continue
+        arxiv_id = match.group(1).rstrip("/").removesuffix(".pdf")
+        return re.sub(r"v\d+$", "", arxiv_id, flags=re.IGNORECASE)
+    return ""
+
+
+def reconstruct_openalex_abstract(inverted_index: Any) -> str:
+    if not isinstance(inverted_index, dict) or not inverted_index:
+        return ""
+    positioned_words: list[tuple[int, str]] = []
+    for word, positions in inverted_index.items():
+        if not isinstance(positions, list):
+            continue
+        for position in positions:
+            if isinstance(position, int) and position >= 0:
+                positioned_words.append((position, str(word)))
+    positioned_words.sort(key=lambda item: item[0])
+    return clean_text(" ".join(word for _, word in positioned_words))
+
+
+def normalize_openalex_date(value: Any) -> str:
+    text = str(value or "").strip()
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+        return f"{text}T00:00:00Z"
+    return text
+
+
+def arxiv_id_month_overlaps_window(arxiv_id: str, start: datetime, end: datetime) -> bool:
+    match = re.fullmatch(r"(\d{2})(\d{2})\.\d{4,5}", normalize_arxiv_id(arxiv_id))
+    if not match:
+        return False
+    year = 2000 + int(match.group(1))
+    month = int(match.group(2))
+    if not 1 <= month <= 12:
+        return False
+    paper_month = year * 12 + month
+    start_month = start.year * 12 + start.month
+    end_month = end.year * 12 + end.month
+    return start_month <= paper_month <= end_month
+
+
 def is_retryable_arxiv_error(exc: Exception) -> bool:
     if isinstance(exc, urllib.error.HTTPError):
         return exc.code in TRANSIENT_HTTP_STATUS_CODES
     return isinstance(
         exc,
-        (urllib.error.URLError, TimeoutError, ConnectionError, ET.ParseError),
+        (urllib.error.URLError, TimeoutError, ConnectionError, ET.ParseError, json.JSONDecodeError),
     )
 
 
@@ -554,6 +811,7 @@ def render_markdown(papers: list[Paper], config: dict[str, Any], start: datetime
         f"# Weekly Literature Radar: {config['topic_name']}",
         "",
         f"- Window UTC: `{start.isoformat()}` to `{end.isoformat()}`",
+        f"- Metadata source: `{config.get('fetch_source', 'arXiv API')}`",
         f"- Total arXiv candidates scanned: `{len(papers)}`",
         f"- Lookback days: `{config['lookback_days']}`",
         f"- Included: `{len(included)}`",
@@ -745,6 +1003,38 @@ def render_section(title: str, papers: list[Paper]) -> list[str]:
     return lines
 
 
+def fetch_papers_with_fallback(
+    config: dict[str, Any],
+    start: datetime,
+    end: datetime,
+) -> tuple[list[Paper], str, int]:
+    queries = build_queries(config, start, end)
+    try:
+        papers = fetch_arxiv_queries(
+            queries,
+            int(config["max_results"]),
+            int(config.get("max_results_per_query", 30)),
+            int(config.get("page_size", 100)),
+            int(config.get("request_retries", 3)),
+            float(config.get("retry_initial_delay_seconds", 5)),
+            float(config.get("retry_max_delay_seconds", 60)),
+            float(config.get("retry_jitter_max_seconds", 5)),
+            float(config.get("retry_total_budget_seconds", 360)),
+            float(config.get("request_interval_seconds", 3.1)),
+        )
+        return papers, "arXiv API", len(queries)
+    except Exception as exc:
+        print(
+            f"Primary arXiv API failed ({describe_arxiv_error(exc)}); "
+            "falling back to the OpenAlex arXiv index.",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    searches = build_openalex_searches(config)
+    return fetch_openalex(config, start, end), "OpenAlex arXiv index", len(searches)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="literature-radar/config.json")
@@ -764,21 +1054,10 @@ def main() -> int:
     config = load_config(config_path)
     end = utc_now()
     start = end - timedelta(days=int(config["lookback_days"]))
-    queries = build_queries(config, start, end)
 
     seen_ids = load_seen_ids(state_dir)
-    fetched_papers = fetch_arxiv_queries(
-        queries,
-        int(config["max_results"]),
-        int(config.get("max_results_per_query", 30)),
-        int(config.get("page_size", 100)),
-        int(config.get("request_retries", 3)),
-        float(config.get("retry_initial_delay_seconds", 5)),
-        float(config.get("retry_max_delay_seconds", 60)),
-        float(config.get("retry_jitter_max_seconds", 5)),
-        float(config.get("retry_total_budget_seconds", 360)),
-        float(config.get("request_interval_seconds", 3.1)),
-    )
+    fetched_papers, fetch_source, query_batches = fetch_papers_with_fallback(config, start, end)
+    config["fetch_source"] = fetch_source
     papers = [paper for paper in fetched_papers if paper.arxiv_id not in seen_ids]
     papers = [score_with_rules(paper, config) for paper in papers]
     if config.get("llm", {}).get("enabled", False):
@@ -802,7 +1081,8 @@ def main() -> int:
     print(f"Wrote {json_path}")
     print(f"Wrote {html_path}")
     print(f"Wrote {text_path}")
-    print(f"Query batches: {len(queries)}")
+    print(f"Fetch source: {fetch_source}")
+    print(f"Query batches: {query_batches}")
     print(f"Fetched: {len(fetched_papers)}")
     print(f"New candidates: {len(papers)}")
     print(f"Included: {sum(1 for p in papers if p.decision == 'include')}")
@@ -818,12 +1098,13 @@ def load_seen_ids(state_dir: Path) -> set[str]:
         data = json.load(f)
     if not isinstance(data, list):
         raise RuntimeError(f"Invalid state file format: {state_path}")
-    return {str(item) for item in data}
+    return {normalize_arxiv_id(str(item)) for item in data}
 
 
 def save_seen_ids(state_dir: Path, seen_ids: set[str]) -> None:
     state_path = state_dir / "seen_arxiv_ids.json"
-    state_path.write_text(json.dumps(sorted(seen_ids), ensure_ascii=False, indent=2), encoding="utf-8")
+    canonical_ids = {normalize_arxiv_id(arxiv_id) for arxiv_id in seen_ids}
+    state_path.write_text(json.dumps(sorted(canonical_ids), ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 if __name__ == "__main__":

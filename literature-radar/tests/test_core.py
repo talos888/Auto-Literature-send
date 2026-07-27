@@ -52,6 +52,19 @@ class CoreTests(unittest.TestCase):
         self.assertIn('all:"context-2"', queries[2])
         self.assertTrue(all("submittedDate:[202607010000 TO 202607150000]" in query for query in queries))
 
+    def test_openalex_searches_use_the_same_small_term_batches(self):
+        config = base_config()
+        config["strong_keywords"] = [f"strong-{index}" for index in range(5)]
+        config["context_keywords"] = ["context-1", "context-2"]
+        config["query_terms_per_request"] = 3
+
+        searches = radar.build_openalex_searches(config)
+
+        self.assertEqual(len(searches), 3)
+        self.assertEqual([search.count('"') for search in searches], [6, 6, 2])
+        self.assertEqual(searches[0], '("strong-0" OR "strong-1" OR "strong-2")')
+        self.assertEqual(searches[2], '("context-2")')
+
     def test_arxiv_query_batches_are_deduplicated_sorted_and_capped(self):
         def paper(arxiv_id, published):
             return radar.Paper(
@@ -290,10 +303,10 @@ class CoreTests(unittest.TestCase):
 
             self.assertEqual(
                 radar.load_seen_ids(state_dir),
-                {"2607.00001v1", "2607.00002v1"},
+                {"2607.00001", "2607.00002"},
             )
             stored = json.loads((state_dir / "seen_arxiv_ids.json").read_text(encoding="utf-8"))
-            self.assertEqual(stored, ["2607.00001v1", "2607.00002v1"])
+            self.assertEqual(stored, ["2607.00001", "2607.00002"])
         finally:
             shutil.rmtree(state_dir, ignore_errors=True)
 
@@ -330,11 +343,128 @@ class CoreTests(unittest.TestCase):
             papers = radar.fetch_arxiv_page("all:test", 0, 1, 1, 0, 0)
 
         self.assertEqual(len(papers), 1)
-        self.assertEqual(papers[0].arxiv_id, "2607.00001v1")
+        self.assertEqual(papers[0].arxiv_id, "2607.00001")
         self.assertEqual(papers[0].title, "Agentic Self-Driving Lab for Chemistry")
         self.assertEqual(papers[0].authors, ["Ada Lovelace"])
         self.assertEqual(papers[0].categories, ["cs.AI", "physics.chem-ph"])
         self.assertEqual(papers[0].pdf_url, "https://arxiv.org/pdf/2607.00001v1")
+
+    def test_openalex_work_reconstructs_abstract_and_doi_arxiv_location(self):
+        work = {
+            "display_name": "Agentic Self-Driving Lab",
+            "publication_date": "2026-07-14",
+            "updated_date": "2026-07-15T12:00:00Z",
+            "abstract_inverted_index": {
+                "closed-loop": [1],
+                "A": [0],
+                "platform": [2],
+            },
+            "authorships": [
+                {"author": {"display_name": "Ada Lovelace"}},
+                {"author": {"display_name": "Grace Hopper"}},
+            ],
+            "locations": [
+                {
+                    "source": {"id": "https://openalex.org/S4306400194"},
+                    "landing_page_url": "https://doi.org/10.48550/arXiv.2607.00001v2",
+                    "pdf_url": None,
+                }
+            ],
+        }
+
+        paper = radar.paper_from_openalex_work(work)
+
+        self.assertIsNotNone(paper)
+        assert paper is not None
+        self.assertEqual(paper.arxiv_id, "2607.00001")
+        self.assertEqual(paper.summary, "A closed-loop platform")
+        self.assertEqual(paper.authors, ["Ada Lovelace", "Grace Hopper"])
+        self.assertEqual(paper.published, "2026-07-14T00:00:00Z")
+        self.assertEqual(paper.abs_url, "https://arxiv.org/abs/2607.00001")
+        self.assertEqual(paper.pdf_url, "https://arxiv.org/pdf/2607.00001")
+
+    def test_openalex_batches_are_deduplicated_and_partial_failure_is_tolerated(self):
+        config = base_config()
+        config["context_keywords"] = ["materials discovery", "automated experimentation"]
+        config.update(
+            {
+                "max_results": 10,
+                "max_results_per_query": 10,
+                "query_terms_per_request": 1,
+                "openalex_request_interval_seconds": 0,
+            }
+        )
+        paper = radar.Paper(
+            arxiv_id="2607.00001",
+            title="Agentic Self-Driving Lab",
+            authors=[],
+            summary="",
+            published="2026-07-14T00:00:00Z",
+            updated="",
+            categories=[],
+            abs_url="https://arxiv.org/abs/2607.00001",
+            pdf_url="https://arxiv.org/pdf/2607.00001",
+        )
+        old_paper = radar.Paper(
+            arxiv_id="2401.03428",
+            title="Old arXiv preprint with a new journal date",
+            authors=[],
+            summary="",
+            published="2026-07-14T00:00:00Z",
+            updated="",
+            categories=[],
+            abs_url="https://arxiv.org/abs/2401.03428",
+            pdf_url="https://arxiv.org/pdf/2401.03428",
+        )
+        start = radar.datetime(2026, 7, 1, tzinfo=radar.timezone.utc)
+        end = radar.datetime(2026, 7, 15, tzinfo=radar.timezone.utc)
+        with (
+            patch.object(
+                radar,
+                "fetch_openalex_search",
+                side_effect=[[paper, old_paper], RuntimeError("temporary"), [paper]],
+            ),
+            patch.object(radar.time, "sleep"),
+            patch.object(radar.sys, "stderr", io.StringIO()),
+        ):
+            papers = radar.fetch_openalex(config, start, end)
+
+        self.assertEqual([item.arxiv_id for item in papers], ["2607.00001"])
+
+    def test_arxiv_failure_falls_back_to_openalex(self):
+        config = base_config()
+        config.update(
+            {
+                "max_results": 10,
+                "max_results_per_query": 10,
+                "page_size": 10,
+                "query_terms_per_request": 10,
+            }
+        )
+        fallback_paper = radar.Paper(
+            arxiv_id="2607.00001",
+            title="Fallback result",
+            authors=[],
+            summary="",
+            published="2026-07-14T00:00:00Z",
+            updated="",
+            categories=[],
+            abs_url="https://arxiv.org/abs/2607.00001",
+            pdf_url="https://arxiv.org/pdf/2607.00001",
+        )
+        start = radar.datetime(2026, 7, 1, tzinfo=radar.timezone.utc)
+        end = radar.datetime(2026, 7, 15, tzinfo=radar.timezone.utc)
+        with (
+            patch.object(radar, "fetch_arxiv_queries", side_effect=RuntimeError("rate limited")),
+            patch.object(radar, "fetch_openalex", return_value=[fallback_paper]) as fallback_mock,
+            patch.object(radar.sys, "stderr", io.StringIO()),
+        ):
+            papers, source, batches = radar.fetch_papers_with_fallback(config, start, end)
+
+        self.assertEqual(papers, [fallback_paper])
+        self.assertEqual(source, "OpenAlex arXiv index")
+        self.assertEqual(batches, 1)
+        fallback_mock.assert_called_once_with(config, start, end)
 
     def test_arxiv_429_honors_retry_after_then_recovers(self):
         atom = b"""<?xml version="1.0" encoding="UTF-8"?>
