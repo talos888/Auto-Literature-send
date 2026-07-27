@@ -12,15 +12,18 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import random
 import re
 import sys
 import textwrap
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from html import escape
 from pathlib import Path
 from typing import Any
@@ -29,6 +32,7 @@ from typing import Any
 ARXIV_API = "https://export.arxiv.org/api/query"
 ATOM_NS = {"a": "http://www.w3.org/2005/Atom"}
 SECRET_FIELD_NAMES = {"api_key", "apikey", "secret", "token", "password"}
+TRANSIENT_HTTP_STATUS_CODES = {429, 500, 502, 503, 504}
 
 
 @dataclass
@@ -102,13 +106,27 @@ def fetch_arxiv(
     retries: int,
     retry_initial_delay: float,
     retry_max_delay: float,
+    retry_jitter_max: float = 5,
+    retry_total_budget: float | None = None,
 ) -> list[Paper]:
     papers: list[Paper] = []
     seen_ids: set[str] = set()
     page_size = max(1, min(page_size, 100))
+    retry_deadline = None
+    if retry_total_budget is not None:
+        retry_deadline = time.monotonic() + max(0, retry_total_budget)
     for start in range(0, max_results, page_size):
         batch_size = min(page_size, max_results - start)
-        batch = fetch_arxiv_page(query, start, batch_size, retries, retry_initial_delay, retry_max_delay)
+        batch = fetch_arxiv_page(
+            query,
+            start,
+            batch_size,
+            retries,
+            retry_initial_delay,
+            retry_max_delay,
+            retry_jitter_max,
+            retry_deadline,
+        )
         if not batch:
             break
         for paper in batch:
@@ -117,6 +135,8 @@ def fetch_arxiv(
                 seen_ids.add(paper.arxiv_id)
         if len(batch) < batch_size:
             break
+        if retry_deadline is not None and time.monotonic() + 3.1 > retry_deadline:
+            raise RuntimeError("arXiv retry budget exhausted before the next result page")
         time.sleep(3.1)
     return papers
 
@@ -128,6 +148,8 @@ def fetch_arxiv_page(
     retries: int,
     retry_initial_delay: float,
     retry_max_delay: float,
+    retry_jitter_max: float = 5,
+    retry_deadline: float | None = None,
 ) -> list[Paper]:
     params = urllib.parse.urlencode(
         {
@@ -140,15 +162,42 @@ def fetch_arxiv_page(
     )
     url = f"{ARXIV_API}?{params}"
     request = urllib.request.Request(url, headers={"User-Agent": "literature-radar/0.1"})
+    retries = max(1, retries)
     for attempt in range(1, retries + 1):
         try:
             with urllib.request.urlopen(request, timeout=60) as response:
                 root = ET.fromstring(response.read())
             break
         except Exception as exc:
-            if attempt == retries:
+            if not is_retryable_arxiv_error(exc):
                 raise
-            delay = min(retry_max_delay, retry_initial_delay * (2 ** (attempt - 1)))
+            if attempt == retries:
+                print(
+                    f"arXiv request failed after {attempt} attempts ({describe_arxiv_error(exc)}).",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                raise
+            delay = arxiv_retry_delay(
+                exc,
+                attempt,
+                retry_initial_delay,
+                retry_max_delay,
+                retry_jitter_max,
+            )
+            if retry_deadline is not None:
+                remaining = max(0.0, retry_deadline - time.monotonic())
+                if delay > remaining:
+                    raise RuntimeError(
+                        "arXiv retry budget exhausted: "
+                        f"next wait is {delay:.1f}s but only {remaining:.1f}s remains"
+                    ) from exc
+            print(
+                f"arXiv request attempt {attempt}/{retries} failed "
+                f"({describe_arxiv_error(exc)}); retrying in {delay:.1f}s.",
+                file=sys.stderr,
+                flush=True,
+            )
             time.sleep(delay)
 
     papers: list[Paper] = []
@@ -177,6 +226,60 @@ def fetch_arxiv_page(
             )
         )
     return papers
+
+
+def is_retryable_arxiv_error(exc: Exception) -> bool:
+    if isinstance(exc, urllib.error.HTTPError):
+        return exc.code in TRANSIENT_HTTP_STATUS_CODES
+    return isinstance(
+        exc,
+        (urllib.error.URLError, TimeoutError, ConnectionError, ET.ParseError),
+    )
+
+
+def parse_retry_after(value: str | None, now: datetime | None = None) -> float | None:
+    if not value:
+        return None
+    try:
+        return max(0.0, float(value.strip()))
+    except ValueError:
+        pass
+
+    try:
+        retry_at = parsedate_to_datetime(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if retry_at.tzinfo is None:
+        retry_at = retry_at.replace(tzinfo=timezone.utc)
+    current = now or datetime.now(timezone.utc)
+    return max(0.0, (retry_at.astimezone(timezone.utc) - current).total_seconds())
+
+
+def arxiv_retry_delay(
+    exc: Exception,
+    attempt: int,
+    retry_initial_delay: float,
+    retry_max_delay: float,
+    retry_jitter_max: float,
+) -> float:
+    exponential_delay = min(
+        max(0.0, retry_max_delay),
+        max(0.0, retry_initial_delay) * (2 ** (attempt - 1)),
+    )
+    retry_after = None
+    if isinstance(exc, urllib.error.HTTPError):
+        headers = exc.headers
+        if headers is not None:
+            retry_after = parse_retry_after(headers.get("Retry-After"))
+    base_delay = max(exponential_delay, retry_after or 0.0)
+    jitter_limit = min(max(0.0, retry_jitter_max), base_delay * 0.1)
+    return base_delay + random.uniform(0.0, jitter_limit)
+
+
+def describe_arxiv_error(exc: Exception) -> str:
+    if isinstance(exc, urllib.error.HTTPError):
+        return f"HTTP {exc.code}"
+    return type(exc).__name__
 
 
 def clean_text(value: str) -> str:
@@ -602,6 +705,8 @@ def main() -> int:
         int(config.get("request_retries", 3)),
         float(config.get("retry_initial_delay_seconds", 5)),
         float(config.get("retry_max_delay_seconds", 60)),
+        float(config.get("retry_jitter_max_seconds", 5)),
+        float(config.get("retry_total_budget_seconds", 360)),
     )
     papers = [paper for paper in fetched_papers if paper.arxiv_id not in seen_ids]
     papers = [score_with_rules(paper, config) for paper in papers]

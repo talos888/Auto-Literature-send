@@ -1,4 +1,5 @@
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -282,6 +283,122 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(papers[0].authors, ["Ada Lovelace"])
         self.assertEqual(papers[0].categories, ["cs.AI", "physics.chem-ph"])
         self.assertEqual(papers[0].pdf_url, "https://arxiv.org/pdf/2607.00001v1")
+
+    def test_arxiv_429_honors_retry_after_then_recovers(self):
+        atom = b"""<?xml version="1.0" encoding="UTF-8"?>
+        <feed xmlns="http://www.w3.org/2005/Atom"></feed>
+        """
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return atom
+
+        rate_limited = radar.urllib.error.HTTPError(
+            "https://export.arxiv.org/api/query",
+            429,
+            "Too Many Requests",
+            {"Retry-After": "7"},
+            None,
+        )
+        with (
+            patch.object(radar.urllib.request, "urlopen", side_effect=[rate_limited, FakeResponse()]) as open_mock,
+            patch.object(radar.random, "uniform", return_value=0),
+            patch.object(radar.time, "sleep") as sleep_mock,
+            patch.object(radar.sys, "stderr", io.StringIO()),
+        ):
+            papers = radar.fetch_arxiv_page("all:test", 0, 1, 2, 1, 60)
+
+        self.assertEqual(papers, [])
+        self.assertEqual(open_mock.call_count, 2)
+        sleep_mock.assert_called_once_with(7.0)
+
+    def test_arxiv_permanent_http_error_is_not_retried(self):
+        bad_request = radar.urllib.error.HTTPError(
+            "https://export.arxiv.org/api/query",
+            400,
+            "Bad Request",
+            {},
+            None,
+        )
+        with (
+            patch.object(radar.urllib.request, "urlopen", side_effect=bad_request) as open_mock,
+            patch.object(radar.time, "sleep") as sleep_mock,
+        ):
+            with self.assertRaises(radar.urllib.error.HTTPError):
+                radar.fetch_arxiv_page("all:test", 0, 1, 4, 1, 60)
+
+        self.assertEqual(open_mock.call_count, 1)
+        sleep_mock.assert_not_called()
+
+    def test_arxiv_transient_error_without_headers_uses_backoff(self):
+        atom = b'<feed xmlns="http://www.w3.org/2005/Atom"></feed>'
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return atom
+
+        unavailable = radar.urllib.error.HTTPError(
+            "https://export.arxiv.org/api/query",
+            503,
+            "Service Unavailable",
+            None,
+            None,
+        )
+        with (
+            patch.object(radar.urllib.request, "urlopen", side_effect=[unavailable, FakeResponse()]),
+            patch.object(radar.random, "uniform", return_value=0),
+            patch.object(radar.time, "sleep") as sleep_mock,
+            patch.object(radar.sys, "stderr", io.StringIO()),
+        ):
+            papers = radar.fetch_arxiv_page("all:test", 0, 1, 2, 2, 60)
+
+        self.assertEqual(papers, [])
+        sleep_mock.assert_called_once_with(2)
+
+    def test_arxiv_retry_stops_when_total_budget_is_insufficient(self):
+        rate_limited = radar.urllib.error.HTTPError(
+            "https://export.arxiv.org/api/query",
+            429,
+            "Too Many Requests",
+            {"Retry-After": "60"},
+            None,
+        )
+        with (
+            patch.object(radar.urllib.request, "urlopen", side_effect=rate_limited) as open_mock,
+            patch.object(radar.random, "uniform", return_value=0),
+            patch.object(radar.time, "monotonic", return_value=100),
+            patch.object(radar.time, "sleep") as sleep_mock,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "retry budget exhausted"):
+                radar.fetch_arxiv_page(
+                    "all:test",
+                    0,
+                    1,
+                    4,
+                    1,
+                    60,
+                    retry_deadline=110,
+                )
+
+        self.assertEqual(open_mock.call_count, 1)
+        sleep_mock.assert_not_called()
+
+    def test_retry_after_http_date_is_parsed(self):
+        now = radar.datetime(2026, 7, 27, 0, 0, tzinfo=radar.timezone.utc)
+        delay = radar.parse_retry_after("Mon, 27 Jul 2026 00:00:30 GMT", now)
+        self.assertEqual(delay, 30)
 
     def test_report_rendering_contains_sections_and_no_match_message(self):
         config = {"topic_name": "Test Radar", "lookback_days": 14}
